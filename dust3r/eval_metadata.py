@@ -1,0 +1,204 @@
+import os
+import glob
+from tqdm import tqdm
+
+# Define the merged dataset metadata dictionary
+dataset_metadata = {
+    'mvsec': {
+        'all_img_path': "data/MVSEC/processed_rect_odem",
+        'seq_img_path': "data/MVSEC/monst3r_test_rect_odem/l30",
+        'mask_path': None,
+        # 'dir_path_func': lambda img_path, seq: os.path.join(img_path, seq, "image_left"),
+        'dir_path_func': lambda seq_img_path, seq, seqidx: os.path.join(seq_img_path, seq, f"seq{seqidx}/image_left_interpolated"),
+        'event_path_func': lambda seq_img_path, seq, seqidx: os.path.join(seq_img_path, seq, f"seq{seqidx}/event_left/event_voxel_left"),
+        'event_stream_all_path': lambda all_img_path, seq: os.path.join(all_img_path, seq, "event_left/all_event.hdf5"),
+        # 'dir_path_func': lambda seq_img_path, seq: os.path.join(seq_img_path, seq, "seq65/image_evlight_left"),
+        # 'gt_traj_func': lambda seq_img_path, anno_path, seq: os.path.join(seq_img_path, seq, "odem_pose_left.txt"),
+        'gt_traj_func': lambda seq_img_path, anno_path, seq, seqidx: os.path.join(seq_img_path, seq, f"seq{seqidx}/odem_pose_left.txt"),
+        'traj_format': 'mvsec',
+        'seq_list': ["indoor_flying1/indoor_flying1","indoor_flying2/indoor_flying2","indoor_flying3/indoor_flying3","outdoor_day/outdoor_day1",
+                    "outdoor_night/outdoor_night1","outdoor_night/outdoor_night2","outdoor_night/outdoor_night3"],
+        'full_seq': False,
+        'mask_path_seq_func': lambda mask_path, seq: None,
+        'skip_condition': None,
+        'process_func': lambda args, all_img_path: process_ours('mvsec', args, all_img_path),
+    },
+    'carla3d': {
+        'all_img_path': "data/carla_3d",
+        'seq_img_path': "data/carla_3d_split/l20",
+        'mask_path': None,
+        # 'dir_path_func': lambda img_path, seq: os.path.join(img_path, seq, "image_left"),
+        'dir_path_func': lambda seq_img_path, seq, seqidx: os.path.join(seq_img_path, seq, f"seq{seqidx}/image_left_interpolated"),
+        'event_path_func': lambda seq_img_path, seq, seqidx: os.path.join(seq_img_path, seq, f"seq{seqidx}/event_left/event_voxel_left"),
+        'event_stream_all_path': lambda all_img_path, seq: os.path.join(all_img_path, seq, "event_left/all_event.hdf5"),
+        # 'dir_path_func': lambda seq_img_path, seq: os.path.join(seq_img_path, seq, "seq65/image_evlight_left"),
+        # 'gt_traj_func': lambda seq_img_path, anno_path, seq: os.path.join(seq_img_path, seq, "odem_pose_left.txt"),
+        'gt_traj_func': lambda seq_img_path, anno_path, seq, seqidx: os.path.join(seq_img_path, seq, f"seq{seqidx}/odem_pose_left.txt"),
+        'traj_format': 'mvsec',
+        'seq_list': ["sequence_Iter1_Town10HD_Opt_ClearNight",
+                    "sequence_Iter1_Town10HD_Opt_ClearNoon",
+                    "sequence_Iter2_Town10HD_Opt_ClearNight",
+                    "sequence_Iter2_Town10HD_Opt_ClearNoon",
+                    "sequence_Iter3_Town10HD_Opt_ClearNight",
+                    "sequence_Iter3_Town10HD_Opt_ClearNoon"],
+        'full_seq': False,
+        'mask_path_seq_func': lambda mask_path, seq: None,
+        'skip_condition': None,
+        'process_func': lambda args, all_img_path: process_ours('carla3d', args, all_img_path),
+    },
+    'davis': {
+        'img_path': "data/davis/DAVIS/JPEGImages/480p",
+        'mask_path': "data/davis/DAVIS/masked_images/480p",
+        'dir_path_func': lambda img_path, seq: os.path.join(img_path, seq),
+        'gt_traj_func': lambda img_path, anno_path, seq: None,
+        'traj_format': None,
+        'seq_list': None,
+        'full_seq': True,
+        'mask_path_seq_func': lambda mask_path, seq: os.path.join(mask_path, seq),
+        'skip_condition': None,
+        'process_func': None,  # Not used in mono depth estimation
+    },
+    'kitti': {
+        'img_path': "data/kitti/depth_selection/val_selection_cropped/image_gathered",  # Default path
+        'mask_path': None,
+        'dir_path_func': lambda img_path, seq: os.path.join(img_path, seq),
+        'gt_traj_func': lambda img_path, anno_path, seq: None,
+        'traj_format': None,
+        'seq_list': None,
+        'full_seq': True,
+        'mask_path_seq_func': lambda mask_path, seq: None,
+        'skip_condition': None,
+        'process_func': lambda args, img_path: process_kitti(args, img_path),
+    },
+    'bonn': {
+        'img_path': "data/bonn/rgbd_bonn_dataset",
+        'mask_path': None,
+        'dir_path_func': lambda img_path, seq: os.path.join(img_path, f'rgbd_bonn_{seq}', 'rgb_110'),
+        'gt_traj_func': lambda img_path, anno_path, seq: os.path.join(img_path, f'rgbd_bonn_{seq}', 'groundtruth_110.txt'),
+        'traj_format': 'tum',
+        'seq_list': ["balloon2", "crowd2", "crowd3", "person_tracking2", "synchronous"],
+        'full_seq': False,
+        'mask_path_seq_func': lambda mask_path, seq: None,
+        'skip_condition': None,
+        'process_func': lambda args, img_path: process_bonn(args, img_path),
+    },
+    'nyu': {
+        'img_path': "data/nyu-v2/val/nyu_images",
+        'mask_path': None,
+        'process_func': lambda args, img_path: process_nyu(args, img_path),
+    },
+    'scannet': {
+        'img_path': "data/scannetv2",
+        'mask_path': None,
+        'dir_path_func': lambda img_path, seq: os.path.join(img_path, seq, 'color_90'),
+        'gt_traj_func': lambda img_path, anno_path, seq: os.path.join(img_path, seq, 'pose_90.txt'),
+        'traj_format': 'replica',
+        'seq_list': None,
+        'full_seq': True,
+        'mask_path_seq_func': lambda mask_path, seq: None,
+        'skip_condition': lambda save_dir, seq: os.path.exists(os.path.join(save_dir, seq)),
+        'process_func': lambda args, img_path: process_scannet(args, img_path),
+    },
+    'tum': {
+        'img_path': "data/tum",
+        'mask_path': None,
+        'dir_path_func': lambda img_path, seq: os.path.join(img_path, seq, 'rgb_90'),
+        'gt_traj_func': lambda img_path, anno_path, seq: os.path.join(img_path, seq, 'groundtruth_90.txt'),
+        'traj_format': 'tum',
+        'seq_list': None,
+        'full_seq': True,
+        'mask_path_seq_func': lambda mask_path, seq: None,
+        'skip_condition': None,
+        'process_func': None,
+    },
+    'sintel': {
+        'img_path': "data/sintel/training/final",
+        'anno_path': "data/sintel/training/camdata_left",
+        'mask_path': None,
+        'dir_path_func': lambda img_path, seq: os.path.join(img_path, seq),
+        'gt_traj_func': lambda img_path, anno_path, seq: os.path.join(anno_path, seq),
+        'traj_format': None,
+        'seq_list': ["alley_2", "ambush_4", "ambush_5", "ambush_6", "cave_2", "cave_4", "market_2",
+                     "market_5", "market_6", "shaman_3", "sleeping_1", "sleeping_2", "temple_2", "temple_3"],
+        'full_seq': False,
+        'mask_path_seq_func': lambda mask_path, seq: None,
+        'skip_condition': None,
+        'process_func': lambda args, img_path: process_sintel(args, img_path),
+    },
+}
+
+# Define processing functions for each dataset
+def process_ours(dataset_name,args, img_path):
+    if args.full_seq:
+        if dataset_name == 'mvsec':
+            seq_list = ["indoor_flying1/indoor_flying1","indoor_flying2/indoor_flying2","indoor_flying3/indoor_flying3",
+                        "outdoor_day/outdoor_day1",
+                        "outdoor_night/outdoor_night1","outdoor_night/outdoor_night2","outdoor_night/outdoor_night3"]
+        elif dataset_name == 'carla3d':
+            seq_list = ["sequence_Iter1_Town10HD_Opt_ClearNight",
+                        "sequence_Iter1_Town10HD_Opt_ClearNoon",
+                        "sequence_Iter2_Town10HD_Opt_ClearNight",
+                        "sequence_Iter2_Town10HD_Opt_ClearNoon",
+                        "sequence_Iter3_Town10HD_Opt_ClearNight",
+                        "sequence_Iter3_Town10HD_Opt_ClearNoon"]
+    else:
+        seq_list = args.seq_list
+    print(f'Processing sequences: {seq_list}')
+    for seq in tqdm(seq_list):
+        # filelist = sorted(glob.glob(f'{img_path}/{seq}/image_left_inpainted/*.png'))
+        filelist = sorted(glob.glob(f'{img_path}/{seq}/image_left_interpolated/*.png'))
+        if args.use_event_control:
+            event_filelist = sorted(glob.glob(f'{img_path}/{seq}/event_left/event_voxel_left/*.hdf5'))
+        else:
+            event_filelist = None
+        # filelist = sorted(glob.glob(f'{img_path}/{seq}/seq65/image_left/*.png'))
+        save_dir = f'{args.output_dir}/{seq}'
+        if 'indoor_flying1' in seq:
+            filelist = filelist[140:1200]
+            # event_filelist = event_filelist[140:1200]
+        yield filelist, save_dir, event_filelist
+
+def process_kitti(args, img_path):
+    for dir in tqdm(sorted(glob.glob(f'{img_path}/*'))):
+        filelist = sorted(glob.glob(f'{dir}/*.png'))
+        save_dir = f'{args.output_dir}/{os.path.basename(dir)}'
+        yield filelist, save_dir
+
+def process_bonn(args, img_path):
+    if args.full_seq:
+        for dir in tqdm(sorted(glob.glob(f'{img_path}/*/'))):
+            filelist = sorted(glob.glob(f'{dir}/rgb/*.png'))
+            save_dir = f'{args.output_dir}/{os.path.basename(os.path.dirname(dir))}'
+            yield filelist, save_dir
+    else:
+        seq_list = ["balloon2", "crowd2", "crowd3", "person_tracking2", "synchronous"] if args.seq_list is None else args.seq_list
+        for seq in tqdm(seq_list):
+            filelist = sorted(glob.glob(f'{img_path}/rgbd_bonn_{seq}/rgb_110/*.png'))
+            save_dir = f'{args.output_dir}/{seq}'
+            yield filelist, save_dir
+
+def process_nyu(args, img_path):
+    filelist = sorted(glob.glob(f'{img_path}/*.png'))
+    save_dir = f'{args.output_dir}'
+    yield filelist, save_dir
+
+def process_scannet(args, img_path):
+    seq_list = sorted(glob.glob(f'{img_path}/*'))
+    for seq in tqdm(seq_list):
+        filelist = sorted(glob.glob(f'{seq}/color_90/*.jpg'))
+        save_dir = f'{args.output_dir}/{os.path.basename(seq)}'
+        yield filelist, save_dir
+
+def process_sintel(args, img_path):
+    if args.full_seq:
+        for dir in tqdm(sorted(glob.glob(f'{img_path}/*/'))):
+            filelist = sorted(glob.glob(f'{dir}/*.png'))
+            save_dir = f'{args.output_dir}/{os.path.basename(os.path.dirname(dir))}'
+            yield filelist, save_dir
+    else:
+        seq_list = ["alley_2", "ambush_4", "ambush_5", "ambush_6", "cave_2", "cave_4", "market_2",
+                    "market_5", "market_6", "shaman_3", "sleeping_1", "sleeping_2", "temple_2", "temple_3"]
+        for seq in tqdm(seq_list):
+            filelist = sorted(glob.glob(f'{img_path}/{seq}/*.png'))
+            save_dir = f'{args.output_dir}/{seq}'
+            yield filelist, save_dir

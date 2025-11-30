@@ -1,0 +1,465 @@
+# Copyright (C) 2024-present Naver Corporation. All rights reserved.
+# Licensed under CC BY-NC-SA 4.0 (non-commercial use only).
+#
+# --------------------------------------------------------
+# DUSt3R model class with ControlNet-inspired event voxel control
+# --------------------------------------------------------
+from copy import deepcopy
+import torch
+import torch.nn as nn
+import os
+from packaging import version
+import huggingface_hub
+
+from .utils.misc import fill_default_args, freeze_all_params, is_symmetrized, interleave, transpose_to_landscape
+from .heads import head_factory
+from dust3r.patch_embed import get_patch_embed, ManyAR_PatchEmbed
+from third_party.raft import load_RAFT
+
+import dust3r.utils.path_to_croco  # noqa: F401
+from models.croco import CroCoNet  # noqa
+from .event_model import create_model
+from .event_model.fusion import FeatureFusionLayer
+from .event_model.lightup_net import EvLightEnhancer
+
+import cv2
+import torch.nn.functional as F
+import math
+inf = float('inf')
+
+hf_version_number = huggingface_hub.__version__
+assert version.parse(hf_version_number) >= version.parse("0.22.0"), "Outdated huggingface_hub version, please reinstall requirements.txt"
+
+def load_model(model_path, device, verbose=True):
+    if verbose:
+        print('... loading model from', model_path)
+    ckpt = torch.load(model_path, map_location='cpu')
+    args = ckpt['args'].model.replace("ManyAR_PatchEmbed", "PatchEmbedDust3R")
+    if 'landscape_only' not in args:
+        args = args[:-1] + ', landscape_only=False)'
+    else:
+        args = args.replace(" ", "").replace('landscape_only=True', 'landscape_only=False')
+    assert "landscape_only=False" in args
+    if verbose:
+        print(f"instantiating : {args}")
+    net = eval(args)
+    s = net.load_state_dict(ckpt['model'], strict=False)
+    if verbose:
+        print(s)
+    return net.to(device)
+
+
+class AsymmetricCroCo3DStereo (
+    CroCoNet,
+    huggingface_hub.PyTorchModelHubMixin,
+    library_name="dust3r",
+    repo_url="https://github.com/junyi/monst3r",
+    tags=["image-to-3d"],
+):
+    """ Two siamese encoders, followed by two decoders with event voxel control.
+    The goal is to output 3d points directly, both images in view1's frame
+    (hence the asymmetry). Event voxel data is used as a control signal.
+    """
+
+    def __init__(self,
+                 output_mode='pts3d',
+                 head_type='linear',
+                 depth_mode=('exp', -inf, inf),
+                 conf_mode=('exp', 1, inf),
+                 freeze='none',
+                 landscape_only=True,
+                 patch_embed_cls='PatchEmbedDust3R',  # PatchEmbedDust3R or ManyAR_PatchEmbed
+                 use_event_control=True,  # Flag to enable event control
+                 event_in_channels=5,    # Event voxel input channels
+                 use_lowlight_enhancer=False,  # Flag to enable EvLightEnhancer
+                 use_cross_attention_for_event=False,  # Flag to enable cross attention in event encoder
+                 event_enhance_mode='none',  # 'none', 'easy', or 'complex'
+                 **croco_kwargs):
+        self.patch_embed_cls = patch_embed_cls
+        self.use_event_control = use_event_control
+        self.event_in_channels = event_in_channels
+
+        self.use_lowlight_enhancer = use_lowlight_enhancer
+        self.use_cross_attention_for_event = use_cross_attention_for_event
+        self.event_enhance_mode = event_enhance_mode
+
+        self.croco_args = fill_default_args(croco_kwargs, super().__init__)
+        super().__init__(**croco_kwargs)
+
+        # dust3r specific initialization
+        self.dec_blocks2 = deepcopy(self.dec_blocks)
+        self.set_downstream_head(output_mode, head_type, landscape_only, depth_mode, conf_mode, **croco_kwargs)
+        self.set_freeze(freeze)
+
+        # Event control initialization
+        if self.use_event_control:
+            self._init_event_control(croco_kwargs.get('img_size', 224), croco_kwargs.get('patch_size', 16),
+                                    croco_kwargs.get('enc_embed_dim', 768), croco_kwargs.get('dec_embed_dim', 768))
+            self.patch_size = croco_kwargs.get('patch_size', 16)
+            self.ll_threshold_ratio = 0.5
+        # Low-light enhancer initialization
+        if self.use_lowlight_enhancer:
+            print("Initializing EvLightEnhancer for low-light image enhancement")
+            print(f"Enhancement mode: {self.event_enhance_mode}")
+            self.enhancer = EvLightEnhancer(
+                mode=self.event_enhance_mode,
+                image_channels=3, 
+                event_channels=self.event_in_channels,
+            )
+    def zero_module(self, module):
+        for p in module.parameters():
+            nn.init.zeros_(p)
+        return module
+
+    def masks_to_patch_masks(self, masks):
+        B, H, W = masks.shape
+        # Binarize mask (255 -> 1, 0 -> 0)
+        masks = (masks == 255).float()
+        # Use avg_pool2d to calculate low-light pixel ratio for each patch
+        patch_masks = F.avg_pool2d(masks.unsqueeze(1), kernel_size=self.patch_size, stride=self.patch_size)  # Shape: (B, 1, H/P, W/P)
+        patch_masks = patch_masks.squeeze(1).flatten(1)  # Shape: (B, N), N=(H/P)*(W/P)
+        # Apply threshold to generate binary patch mask
+        patch_masks = (patch_masks >= self.ll_threshold_ratio).float()  # Shape: (B, N)
+        patch_masks = patch_masks.unsqueeze(2)  # Shape: (B, N, 1)
+        return patch_masks
+
+    def _init_event_control(self, img_size, patch_size, enc_embed_dim, dec_embed_dim):
+        """ Initialize modules for processing event voxel data and injecting it into the network. """
+        self.enc_blocks_trainable = create_model()
+        
+        # Feature adjustment layer
+        self.linear_adjust = nn.Linear(768, 1024)
+        self.sigmoid = nn.Sigmoid()
+        
+        # Spatial feature adjustment module
+        self.spatial_adjust = nn.Sequential(
+            nn.Conv2d(768, 768, kernel_size=3, padding=1),
+            nn.BatchNorm2d(768),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(768, 768, kernel_size=3, padding=1),
+            nn.BatchNorm2d(768),
+            nn.ReLU(inplace=True)
+        )
+        
+        # Channel attention module
+        self.channel_attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(768, 768 // 16, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(768 // 16, 768, 1),
+            nn.Sigmoid()
+        )
+        
+        # SNR map processing module
+        self.snr_processor = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+        
+        # Feature fusion module
+        self.fusion_attention = nn.Sequential(
+            nn.Linear(1024, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 1024),
+            nn.Sigmoid()
+        )
+        
+        # Feature normalization layer
+        self.norm = nn.LayerNorm(1024)
+
+        self.fusion_layer = FeatureFusionLayer(
+            dim=1024, fusion_type='concat', num_heads=8
+        )
+        
+        # Initialize weights
+        nn.init.kaiming_normal_(self.linear_adjust.weight, mode='fan_out', nonlinearity='relu')
+        if self.linear_adjust.bias is not None:
+            nn.init.zeros_(self.linear_adjust.bias)
+            
+        # Initialize spatial adjustment module
+        for m in self.spatial_adjust.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+                
+        # Initialize channel attention module
+        for m in self.channel_attention.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                    
+        # Initialize SNR processing module
+        for m in self.snr_processor.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kw):
+        if os.path.isfile(pretrained_model_name_or_path):
+            return load_model(pretrained_model_name_or_path, device='cpu')
+        else:
+            return super(AsymmetricCroCo3DStereo, cls).from_pretrained(pretrained_model_name_or_path, **kw)
+
+    def _set_patch_embed(self, img_size=224, patch_size=16, enc_embed_dim=768):
+        self.patch_embed = get_patch_embed(self.patch_embed_cls, img_size, patch_size, enc_embed_dim)
+
+    def load_state_dict(self, ckpt, **kw):
+        # duplicate all weights for the second decoder if not present
+        new_ckpt = dict(ckpt)
+        if not any(k.startswith('dec_blocks2') for k in ckpt):
+            for key, value in ckpt.items():
+                if key.startswith('dec_blocks'):
+                    new_ckpt[key.replace('dec_blocks', 'dec_blocks2')] = value
+        return super().load_state_dict(new_ckpt, **kw)
+
+    def set_freeze(self, freeze):  # this is for use by downstream models
+        self.freeze = freeze
+        to_be_frozen = {
+            'none':     [],
+            'mask':     [self.mask_token],
+            'encoder':  [self.mask_token, self.patch_embed, self.enc_blocks],
+            'encoder_and_decoder': [self.mask_token, self.patch_embed, self.enc_blocks, self.dec_blocks, self.dec_blocks2],
+            'decoder': [self.dec_blocks, self.dec_blocks2],
+            'all':     [self.mask_token, self.patch_embed, self.enc_blocks, self.dec_blocks, self.dec_blocks2,
+                        self.downstream_head1, self.downstream_head2]
+        }
+        freeze_all_params(to_be_frozen[freeze])
+        print(f'Freezing {freeze} parameters')
+
+    def _set_prediction_head(self, *args, **kwargs):
+        """ No prediction head """
+        return
+
+    def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size,
+                            **kw):
+        if type(img_size) is int:
+            img_size = (img_size, img_size)
+        assert img_size[0] % patch_size == 0 and img_size[1] % patch_size == 0, \
+            f'{img_size=} must be multiple of {patch_size=}'
+        self.output_mode = output_mode
+        self.head_type = head_type
+        self.depth_mode = depth_mode
+        self.conf_mode = conf_mode
+        # allocate heads
+        self.downstream_head1 = head_factory(head_type, output_mode, self, has_conf=bool(conf_mode))
+        self.downstream_head2 = head_factory(head_type, output_mode, self, has_conf=bool(conf_mode))
+        # magic wrapper
+        self.head1 = transpose_to_landscape(self.downstream_head1, activate=landscape_only)
+        self.head2 = transpose_to_landscape(self.downstream_head2, activate=landscape_only)
+        
+        # Initialize SNR map storage
+        self._last_snr_map = None
+
+    def _encode_image(self, image, true_shape, event_voxel=None, LL_mask=None):
+
+        if self.use_lowlight_enhancer:
+            image, snr_map = self.enhancer(image, event_voxel)
+            # Save snr_map for feature recording
+            self._last_snr_map = snr_map
+        else:
+            snr_map = None
+            self._last_snr_map = None
+
+
+        # embed the image into patches  (x has size B x Npatches x C)
+        x, pos = self.patch_embed(image, true_shape=true_shape)
+        # x (B, 576, 1024) pos (B, 576, 2); patch_size=16
+        B,N,C = x.size()
+        posvis = pos
+
+        # Add positional embedding without cls token
+        assert self.enc_pos_embed is None
+
+        # Apply transformer encoder blocks with event control
+        image_features = {}
+        for i, blk in enumerate(self.enc_blocks):
+            x = blk(x, posvis)
+            # 24 blocks, each output shape is [2, 576, 1024]
+            if (i+1) % (len(self.enc_blocks)/4) == 0:   # 5, 11, 17, 23 layers in monst3r encoder
+                event_blk_idx = int((i+1) / (len(self.enc_blocks)/4)) - 1
+                image_features[event_blk_idx] = x
+        if self.use_event_control and event_voxel is not None:
+            # 1. Get event features
+            event_feat = self.enc_blocks_trainable(event_voxel, image_features, true_shape=true_shape)[-1]
+            
+            # 2. Calculate target size (optimized: cache true_shape values)
+            h, w = true_shape[0][0].item(), true_shape[0][1].item()
+            scale = int(math.sqrt(h * w / x.shape[1]))
+            rescale_size = (h // scale, w // scale)
+
+            # 3. Spatial feature adjustment
+            event_feat = self.spatial_adjust(event_feat)
+            
+            # 4. Channel attention
+            channel_weights = self.channel_attention(event_feat)
+            event_feat = event_feat * channel_weights
+            
+            # 5. Adjust spatial dimensions
+            event_feat = F.interpolate(event_feat, size=rescale_size, mode='bilinear', align_corners=False)
+            
+            # 6. Reshape to sequence format
+            event_feat = event_feat.reshape(B, -1, N).transpose(1, 2)
+            
+            # 7. Adjust channel number to match image features
+            event_feat = self.linear_adjust(event_feat)
+            
+            # 8. Feature normalization
+            x = self.norm(x)
+            event_feat = self.norm(event_feat)
+            
+            # 9. Calculate attention weights
+            attention_weights = self.fusion_attention(x)
+            
+            # 10. Process SNR map and perform feature fusion
+            if snr_map is not None:
+                # Process SNR map
+                snr_map = F.interpolate(snr_map, size=rescale_size, mode='bilinear', align_corners=False)
+                snr_map = self.snr_processor(snr_map)
+                snr_map = snr_map.reshape(B, 1, N).transpose(1, 2)
+                
+                # Combine SNR weights and attention weights for fusion
+                fusion_weight = snr_map * attention_weights
+                event_feat = event_feat * (1 - fusion_weight)
+                x = x * fusion_weight
+                x = self.fusion_layer(x, event_feat)
+
+            else:
+                # If no SNR map, use attention weights only
+                x = x * attention_weights + event_feat * (1 - attention_weights)
+        x = self.enc_norm(x)
+        return x, pos, None
+
+    def _encode_image_pairs(self, img1, img2, true_shape1, true_shape2, event_voxel1=None, event_voxel2=None, LL_mask1=None, LL_mask2=None):
+        snr_map1 = None
+        snr_map2 = None
+        
+        if img1.shape[-2:] == img2.shape[-2:]:
+            out, pos, _ = self._encode_image(
+                torch.cat((img1, img2), dim=0),
+                torch.cat((true_shape1, true_shape2), dim=0),
+                torch.cat((event_voxel1, event_voxel2), dim=0) if event_voxel1 is not None else None,
+                torch.cat((LL_mask1, LL_mask2), dim=0) if LL_mask1 is not None else None,
+            )
+            out, out2 = out.chunk(2, dim=0)
+            pos, pos2 = pos.chunk(2, dim=0)
+            
+            # Separate SNR maps for two images
+            if hasattr(self, '_last_snr_map') and self._last_snr_map is not None:
+                if self._last_snr_map.dim() > 2:
+                    # Separate SNR maps for two images
+                    snr_map1, snr_map2 = self._last_snr_map.chunk(2, dim=0)
+                    
+                    # Keep _last_snr_map as the first image's SNR map (for backward compatibility)
+                    self._last_snr_map = snr_map1
+                else:
+                    # If only one image's SNR map, duplicate for both images
+                    snr_map1 = snr_map2 = self._last_snr_map
+        else:
+            # Process two images separately
+            out, pos, _ = self._encode_image(img1, true_shape1, event_voxel1, LL_mask1 if LL_mask1 is not None else None)
+            snr_map1 = self._last_snr_map  # Save first image's SNR map
+            
+            out2, pos2, _ = self._encode_image(img2, true_shape2, event_voxel2, LL_mask2 if LL_mask2 is not None else None)
+            snr_map2 = self._last_snr_map  # Save second image's SNR map
+                
+        return out, out2, pos, pos2, snr_map1, snr_map2
+
+    def _encode_symmetrized(self, view1, view2):
+        img1 = view1['img']
+        img2 = view2['img']
+        if 'low_light_mask' in view1:
+            LL_mask1 = view1['low_light_mask']
+            LL_mask2 = view2['low_light_mask']
+        else:
+            LL_mask1 = LL_mask2 = None
+        event_voxel1 = view1.get('event_voxel')
+        event_voxel2 = view2.get('event_voxel')
+        B = img1.shape[0]
+
+        # Recover true_shape when available, otherwise assume that the img shape is the true one
+        shape1 = view1.get('true_shape', torch.tensor(img1.shape[-2:])[None].repeat(B, 1))
+        shape2 = view2.get('true_shape', torch.tensor(img2.shape[-2:])[None].repeat(B, 1))
+
+        # warning! maybe the images have different portrait/landscape orientations
+        if is_symmetrized(view1, view2):
+            # computing half of forward pass!'
+            feat1, feat2, pos1, pos2, snr_map1, snr_map2 = self._encode_image_pairs(
+                img1[::2], img2[::2], shape1[::2], shape2[::2],
+                event_voxel1[::2] if event_voxel1 is not None else None,
+                event_voxel2[::2] if event_voxel2 is not None else None,
+                LL_mask1[::2] if LL_mask1 is not None else None,
+                LL_mask2[::2] if LL_mask2 is not None else None
+            )
+            feat1, feat2 = interleave(feat1, feat2)
+            pos1, pos2 = interleave(pos1, pos2)
+        else:
+            feat1, feat2, pos1, pos2, snr_map1, snr_map2 = self._encode_image_pairs(
+                img1, img2, shape1, shape2, 
+                event_voxel1 if event_voxel1 is not None else None, 
+                event_voxel2 if event_voxel2 is not None else None,
+                LL_mask1 if LL_mask1 is not None else None,
+                LL_mask2 if LL_mask2 is not None else None
+            )
+
+        return (shape1, shape2), (feat1, feat2), (pos1, pos2), (snr_map1, snr_map2)
+
+    def _decoder(self, f1, pos1, f2, pos2):
+        final_output = [(f1, f2)]  # before projection
+        original_D = f1.shape[-1]
+
+        # project to decoder dim
+        f1 = self.decoder_embed(f1)
+        f2 = self.decoder_embed(f2)
+
+        final_output.append((f1, f2))
+        for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
+            # img1 side
+            f1, _ = blk1(*final_output[-1][::+1], pos1, pos2)
+            # img2 side
+            f2, _ = blk2(*final_output[-1][::-1], pos2, pos1)
+            # store the result
+            final_output.append((f1, f2))
+
+        # normalize last output
+        del final_output[1]  # duplicate with final_output[0]
+        final_output[-1] = tuple(map(self.dec_norm, final_output[-1]))
+        return zip(*final_output)
+
+    def _downstream_head(self, head_num, decout, img_shape):
+        B, S, D = decout[-1].shape
+        # img_shape = tuple(map(int, img_shape))
+        head = getattr(self, f'head{head_num}')
+        return head(decout, img_shape)
+
+    def forward(self, view1, view2):
+        # encode the two images --> B,S,D
+        (shape1, shape2), (feat1, feat2), (pos1, pos2), (snr_map1, snr_map2) = self._encode_symmetrized(view1, view2)
+
+        # combine all ref images into object-centric representation
+        dec1, dec2 = self._decoder(feat1, pos1, feat2, pos2)
+
+        with torch.cuda.amp.autocast(enabled=False):
+            res1 = self._downstream_head(1, [tok.float() for tok in dec1], shape1)
+            res2 = self._downstream_head(2, [tok.float() for tok in dec2], shape2)
+
+        res2['pts3d_in_other_view'] = res2.pop('pts3d')  # predict view2's pts3d in view1's frame
+        res1['snr_map'] = snr_map1
+        res2['snr_map'] = snr_map2
+        return res1, res2
