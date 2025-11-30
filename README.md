@@ -7,6 +7,8 @@
 [![NeurIPS](https://img.shields.io/badge/NeurIPS%202025-Spotlight-red.svg)](https://openreview.net/pdf?id=Lf0W2gmNBg)
 [![Website](https://img.shields.io/badge/Project-Website-blue)](https://candy-crusher.github.io/EAG3R_Proj/#) <br/>
 
+<img src="assets/teaser.png" width="100%"/>
+
 <p>
   <em>EAG3R enables robust dense 3D reconstruction in extreme low-light and dynamic scenes where standard RGB methods fail, by effectively fusing asynchronous event streams with image data.</em>
 </p>
